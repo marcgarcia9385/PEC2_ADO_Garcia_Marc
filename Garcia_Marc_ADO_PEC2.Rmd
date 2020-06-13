@@ -1,0 +1,1703 @@
+---
+title: "PEC2: Análisis de datos de RNAseq con DESeq2"
+author: "Marc Garcia"
+date: "31/05/2020"
+output:
+  html_document:
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+header-includes:
+  - \usepackage{booktabs}
+bibliography: bibliography.bib
+link-citations: yes
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = T, cache = T, comment = NA)
+knitr::opts_chunk$set(root.dir = "C:/Users/USER/Documents/Màster Bioestadística i Bioinfo/Análisis de datos Ómicos/PECS/ADO_PEC2_Marc_Garcia/")
+options(knitr.kable.NA = '')
+
+```
+
+* * *
+
+<div align = "justify">
+
+<style>
+    body .main-container {
+        max-width: 1550px;
+    }
+    
+</style>
+
+# Abstract
+
+<br>
+
+El transcriptoma es el conjunto de moléculas de ARN -codificantes y no codificantes- presentes en una célula o grupo de células en un momento determinado. Partiendo de muestras de tejido tiroideo sin infiltrar (NIT), con pequeñas infiltraciones focales (SFI) y con infiltraciones extensivas (ELI), pretendemos comparar sus transcriptomas e identificar aquellos genes que están diferencialmente expresados en cada una de las posibles comparaciones (NIT-SFI, NIT-ELI, SFI-ELI). Con este objetivo en mente, se analizarán datos provenientes de RNAseq, una técnica de secuenciación que, en contraste con los microarrays, permite detectar hasta un 25% más de DEG entre condiciones. El procesado de los datos y la búsqueda de DEG se realizará mediante el software estadístico [R](https://cran.r-project.org/index.html) (versión `r R.Version()$major`.`r R.Version()$minor`) y de paquetes del proyecto [BioConductor](https://www.bioconductor.org/) (versión `r tools:::.BioC_version_associated_with_R_version()`). Los datos y el código relacionados con el análisis pueden ser consultados en el siguiente [repositorio GitHub](https://github.com/marcgarcia9385/pec2-ado-marc-garcia.git).
+ 	
+<br>
+
+# Objetivos
+
+<br>
+
+El objetivo del estudio es aportar nueva información y mejorar el conocimiento del efecto que tiene la presencia -en diferente grado- de infiltraciones en el tejido tiroideo. En esta dirección, se pretende identificar -a partir de los *counts* obtenidos mediante *RNAseq*- que genes y que vías metabólicas están diferencialmente expresados en cada una de las posibles comparaciones entre las tres condiciones experimentales (NIT, SFI, ELI). 
+
+<br>
+
+# Materiales & Métodos
+
+<br>
+
+## Materiales
+
+<br>
+
+### Software
+
+<br>
+
+Aunque se ha propuesto el uso del software `Galaxy` [@Afgan2016] como alternativa para este análisis, nosotros nos hemos decantado por la combinación de `R` (versión `r R.Version()$major`.`r R.Version()$minor`) y `BioConductor` (versión `r tools:::.BioC_version_associated_with_R_version()`). Además, para facilitar el procesado y hacerlo más cómodo visualmente, hemos utilizado la interfaz `R-Studio` [@RStudio2015]. En la *Tabla 1* se muestra un listado con los paquetes implementados durante el análisis.
+
+<br>
+
+```{r packages list, echo=F, warning=F, message=F}
+
+library(knitr)
+library(kableExtra)
+library(readxl)
+library(magrittr)
+
+packages <- read_xlsx(path = "other/packages_1.xlsx")
+
+kable(x = packages,
+      format = "html",
+      align = "ccccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, color = "white", background = "#482677FF") %>%
+   scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+**Tabla 1:** lista de paquetes utilizados durante el análisis.
+
+<br>
+
+### Datos
+
+<br>
+
+```{r data, include=F}
+
+options(scipen = 99999)
+genes <- 56202
+experimental_conditions <- 3
+n_nit_pre <- 236
+n_sfi_pre <- 42
+n_eli_pre <- 14
+n_nit_post <- 10
+n_sfi_post <- 10
+n_eli_post <- 10
+n_sum_post <- n_nit_post + n_sfi_post + n_eli_post
+
+```
+
+Los datos utilizados para el análisis provienen del portal **GTEx** [@Carithers2015], un servidor web que subministra datos asociados a estudios relacionados con la expresión de hasta 54 tejidos diferentes. En contraste con lo que vimos en la PEC 1, no tenemos que descargar los datos desde ningún portal o servidor. De hecho, se nos han subministrado un par de archivos (`counts.csv`, `targets.csv`) que incluyen -respectivamente- los *counts* crudos de cada uno de los genes estudiados e información acerca de cada una de las muestras (**metadata**). 
+
+<br>
+
+Vamos a centrarnos un poco más en el contenido. Como ya se ha comentado anteriormente, los datos corresponden a un estudio que pretendía identificar que genes están diferencialmente expresados en la tiroides en función de la presencia y el grado de infilitraciones en este tejido. En consecuencia, nos encontramos frente a un diseño factorial de un factor (**Grado de infiltración**) con `r experimental_conditions` niveles (NIT, SFI, ELI). Como veremos posteriormente, antes del preprocesado dispondremos de una matriz cruda con un total de `r n_nit_pre + n_sfi_pre + n_eli_pre` muestras (`r n_nit_pre` NIT, `r n_sfi_pre` SFI y `r n_eli_pre` ELI) y `r genes` genes. Sin embargo, una vez seleccionadas -aleatoriamente- las muestras para el análisis, cada nivel conformará un único grupo experimental compuesto de `r n_nit_post` réplicas biológicas y, por lo tanto, el tamaño muestral del experimento será de `r n_sum_post` muestras.
+
+<br>
+
+## Métodos
+
+<br>
+
+El análisis de datos provenientes de RNAseq se puede realizar siguiendo protocolos muy variables. En esta sección del informe se intenta resumir un *workflow* que gira entorno al paquete `DESeq2` [@Love2014] y que está bastante extendido entre la comunidad científica.
+
+<br>
+
+### Preparando entorno de trabajo
+
+<br>
+
+Para facilitar el análisis, intentaremos almacenar todos los datos de origen, resultados y ficheros intermedios utilizando una estructura ramificada y jerarquizada de directorios comprendida en el interior de nuestro directorio de trabajo (*`r getwd()`*). Principalmente, este subconjunto estará formado por los cuatro directorios siguientes:
+
+<br>
+
++ <p>**data:** contendrá -entre otros- las matrices con los counts (original, subset y subset normalizado) y los ficheros con la información de las muestras (original y subset).</p>
++ <p>**results:** contendrá los resultados generados durante el análisis.</p>
++ <p>**figures:** aquí guardaremos las figuras generadas durante el análisis.</p>
++ <p>**other:** incluirá otro tipo de contenido como la tabla con la información sobre los paquetes utilizados.</p>
+
+<br>
+
+### Análisis exploratorio
+
+<br>
+
+El primer paso del *pipeline* de análisis consiste en un breve análisis exploratorio para identificar que estructura tienen los datos y cual es su contenido. En esta dirección, hemos utilizado una batería de funciones clásicas de `R`. Entre estas destacan las funciones `View()`, `str()`, `head()`, `colnames()` o `dim()`. Todas estas funciones pertenecen a los paquetes `base` y `utils` [@RCore2019].
+
+<br>
+
+### Preprocesado de los datos
+
+<br>
+
+#### Selección de muestras
+
+```{r data preprocessing 1, include=F}
+
+n_samples <- 30
+n_groups <- 3
+n_groupal <- n_samples/n_groups
+
+```
+
+<br>
+
+Para simplificar el análisis a la vez que garantizamos que los resultados obtenidos sean significativos, queremos que la representación de cada grupo se reduzca y sea idéntica. Además, para que los resultados de cada alumno sean ligeramente diferentes, queremos que la selección de estas muestras se haga de forma aleatoria. Consecuentemente, el objetivo de este apartado consiste en seleccionar -del total de muestras y de forma aleatoria- un *subset* de `r n_samples` compuesto por `r n_groupal` muestras de cada uno de los grupos. Con este objetivo, utilizaremos la sintaxis de los corchetes y las funciones `as.character()`, `set.seed()` y `sample()` del paquete `base` [@RCore2019].
+
+<br>
+
+#### Cambio de nombre muestras
+
+<br>
+
+Adicionalmente, esta sección incluye el cambio de nombre de las muestras y el guardado del contenido en un nuevo archivo `.csv`. Con este objetivo en mente, utilizaremos la sintaxis de corchetes combinada con las funciones `colnames()`, `rownames()`, `paste0()` y `write.csv()` del paquete `base` [@RCore2019]. 
+
+<br>
+
+#### Construcción DESeq dataset
+
+<br>
+
+Antes de proseguir con el análisis, si queremos utilizar el paquete `DESeq2` [@Love2014] para el análisis, debemos generar un objeto de tipo `DESeqDataSet`. Como veremos más adelante, estos objetos presentan similitudes con la estructura de los `ExpressionSet` que vimos en la PEC 1. Con este objetivo en mente utilizaremos la función `DESeqDataSetFromMatrix()`. Como argumentos especificaremos la matriz de *counts* cruda (`countData`), los metadatos (`colData`) y el diseño factorial (`design`). 
+
+<br>
+
+#### Eliminación de genes
+
+<br>
+
+Aunque este paso no es estrictamente necesario, con el objetivo de dinamizar el análisis, una de las primeras etapas consiste en eliminar -de los datos crudos- aquellos genes que no están expresados. Dicho de otro modo, pretendemos descartar aquellos genes que tienen -para todas las muestras- un número de counts igual a 0. Alternativamente, podemos decir que nos queremos quedar únicamente con aquellas filas que tengan como mínimo un *count* (`rowSums` >= 1). En esta dirección utilizaremos la sintaxis de los corchetes combinada con las funciones `rowSums()` del paquete `base` [@RCore2019] y `counts()` del paquete `BiocGenerics` [@Huber2015]. 
+
+<br>
+
+### Estabilización de la varianza
+
+<br>
+
+Algunas de la pruebas gráficas -que utilizaremos a continuación para el control de calidad- funcionan mejor con datos homocedáticos. Es decir, con muestras que -independientemente de su media de *counts*- tienen varianzas o desviaciones estándar parecidas. Ya que la media del número de counts y su varianza siguen -generalmente- una relación positiva, antes de proseguir con el control de calidad, debemos realizar lo que se conoce como **estabilización de la varianza**. El objetivo de este proceso es -precisamente- transformar los datos para que las muestras tengan varianzas similares. Es importante mencionar que, a parte de permitir el control de calidad, este proceso normaliza los datos. Principalmente, existen dos transformaciones ámpliamente utilizadas: la **transformación vst** y la **transformación rlog**. La primera se utiliza para datasets que tienen más de 30 muestras, mientras que la segunda se aplica para aquellos con n < 30. Además, la primera es más rápida y menos sensible a *outliers*. En consecuencia, nosotros utilizaremos esta transformación. Para implementarla usaremos la función `vst()` del paquete `DESeq2` [@Love2014].
+
+<br>
+
+### Control de calidad
+
+<br>
+
+Una vez eliminados los genes que no están expresados en ninguna de las muestras y transformados/normalizados los datos, es necesario realizar un control para determinar si estos tienen la calidad suficiente para ser posteriormente analizados y si hay alguna muestra problemática. En esta dirección, existe una gran variedad de pruebas que podemos realizar, siendo la gran mayoría pruebas gráficas. Como veremos a continuación, entre las más típicas se encuentran los *boxplots*, los *PCAplots* o los dendrogramas.
+
+<br>
+
+#### Boxplots
+
+<br>
+
+Una de las alternativas más clásicas y ámpliamente utilizadas para valorar la calidad de las muestras consiste en construir un *boxplot* que muestre la distribución del número de *pseudocounts* para cada una de las muestras. De este modo podemos comparar las distribuciones entre muestras, identificando cuales de ellas presentan distribuciones que se alejan de lo esperado. En este informe, para construir los *boxplots*, utilizaremos la sintaxis del paquete `ggplot2` [@Hadley2016].
+
+<br>
+
+#### PCA plots
+
+<br>
+
+Otra opción muy interesante consiste en construir un *PCA plot*. Este tipo de gráficos se basan en aquellas componentes de los datos que son responsables de la mayor parte de la variabilidad observada entre muestras (**PCs** o **componentes principales**). Son una muy buena opción para determinar si las muestras de un mismo grupo se agrupan conjuntamente e independientemente del resto de grupos. También permiten detectar que muestras se alejan demasiado de su grupo (*outliers*) y, consecuentemente, puede ser que deban ser eliminadas. En contraste con lo comentado para el *boxplot*, para el PCA plot crearemos nuestra propia función (`plotPCA3()`). Esta función ha sido rescatada de la PEC 1 y ligeramente modificada para que se adapte a nuestras necesidades. Su código se muestra en el annexo.
+
+<br>
+
+#### Dendrogramas
+
+<br>
+
+La tercera y última prueba gráfica que utilizaremos para el control de calidad se basa en el *clustering* jerárquico y la posterior construcción de un dendrograma. Este tipo de gráficos son especialmente potentes para identificar si existen diferencias entre las muestras de los grupos experimentales y si existe alguna muestra que podamos catalogar como *outlier*. En realidad, este gráfico aporta información que es complementaria a la del *PCA plot*. Para la construcción del dendrograma utilizaremos las funciones `dist()` del paquete `stats` [@RCore2019] y las funciones `hcut()` y `fviz_dend()` del paquete `factoextra` [@Alboukadel2020].
+
+<br>
+
+### Selección de genes (DEG)
+
+<br> 
+
+Con la intención de identificar que genes estan diferencialmente expresados entre cada una de las dietas y el control, podemos utilizar diferentes enfoques. Aunque existen algunas alternativas que pasan por la utilización de los paquetes `limma` [@Smyth2015] o `edgeR` [@Robinson2009], nosotros hemos preferido utilizar la librería `DESeq2` [@Love2014]. A continuación se describen brevemente todos los psos necesarios para generar el modelo lineal e identificar y visualizar aquellos genes que presentan una expresión diferencial entre comparaciones.
+
+<br>
+
+#### Análisis de Expresión diferencial
+
+<br>
+
+Realizar un análisis de expresión diferencial con el paquete `DESeq2` [@Love2014] es tremendamente fácil. Simplemente debemos aplicar la función `DESeq()` sobre un objeto de tipo `DESeqDataSet`, `DESeqDataSetFromMatrix` o `DESeqDataSetFromHTSeqCount`. Consecuentemente, esta función realizará un análisis por defecto que incluirá -secuencialmente- la estimación de los *size factors*, la estimación de la dispersión y la adaptación de un modelo binomial negativo. 
+
+<br>
+
+#### Consultando resultados contrastes
+
+<br>
+
+Llegados a este punto, una vez hecho el análisis con `DESeq()`, podemos utilizar la función `results()` del paquete `DESeq2` [@Love2014] para consultar los resultados de cada uno de los contrastes. En esta dirección, es importante utilizar el argumento `contrast` y especificar -como un vector string de tres entradas- el factor y los dos niveles que queremos utilizar durante el contraste. Como veremos más adelante, el *output* resultante de `results()` contiene información similar y tiene en un formato muy parecido a las **topTables** que vimos en la PEC1.  
+
+<br>
+
+Otra opción muy interesante que ofrece el *output* de la función `DESeq()` es la capacidad de aplicarle la función `summary()` del paquete `base` [@RCore2019]. Esta opción permite -fijado un p-valor ajustado mediante el argumento `alpha`- obtener una tabla que contiene información, entre otros, sobre el número y porcentaje de genes que están *upregulated* o *downregulated*. Es importante tener en mente 
+
+<br>
+
+#### Anotación de genes
+
+<br>
+
+Ahora ya tenemos construidas las topTables. Sin embargo, la única identificación que tienen las entradas de estas tablas es un identificador de ENSEMBL (**ENSEMBL ID**). Con el objetivo de asociar cada uno de estos identificadores con el nombre del gen al que pertenecen, utilizaremos la función `mapIds()` del paquete `AnnotationDbi` [@Pages2019] y el paquete `org.Hs.eg.db` [@Carlson2019]. Adicionalemnte, también incorporaremos el identificador de **Entrez Gene**. Es importante remarcar que es probable que algunos de los *geneids* de las topTables no sean encontrados en la base de datos y por lo tanto se les asigne un valor NA. Consecuentemente, estas entradas deberán ser eliminadas mediante -por ejemolo- el uso de la función `na.omit()` del paquete `stats` [@RCore2019].
+
+<br>
+
+#### Exportando resultados
+
+<br>
+
+En este punto, si así nos conviene, podemos guardar el contenido de estas topTables en un archivo `.csv` mediante el uso de la función `write.csv()` del paquete `utils` [@RCore2019]. El contenido de las tres topTables generadas lo guardaremos en el directorio `results/topTables` presente en nuestro *working directory*.
+
+<br>
+
+#### Filtrando DEG
+
+<br>
+
+A partir de las topTables generadas mediante la función `results()` podemos filtrar aquellos genes que consideremos como diferencialmente expresados (DEG). Igual que para la PEC 1, consideraremos que estos son aquellos que tienen un p-valor ajustado menor que 0.1 y un log2FC superior o inferior a 2. Para el filtrado podemos utilizar la función `which()` del paquete `BiocGenerics` [@Huber2015] y la sintaxis de corchetes.
+
+<br>
+
+#### Volcano plots
+
+<br>
+
+La visualización de las tablas de genes diferencialmente expresados (DEG) se puede realizar fácilmente mediante **volcano plots**. Estos gráficos relacionan el cambio de expresión entre condiciones (log2 FoldChange) con la evidencia estadística (-log10(P-value)), siendo aquellos genes con valores más extremos en el eje x y con valores superiores en el eje y los que tienen una evidencia más fuerte de estar diferencialmente expresados. Una de las funciones más utilizadas para su construcción es `volcanoplot()` del paquete `limma` [@Smyth2015]. Aún siendo una buena solución, nosotros hemos preferido emplear la función `EnhancedVolcano()` del paquete con el mismo nombre [@Blighe2019]. A diferencia de `volcanoplot()`, `EnhancedVolcano()` permite dibujar el FDR y los logFC *cutoffs*, diferenciando las 4 categorías de genes que nos podemos encontrar mediante una paleta de colores. De este modo, es mucho más fácil identificar que genes presentan evidencia de estar diferencialmente expresados y establecer comparaciones entre los resultados de cada una de las comparaciones.
+
+<br>
+
+### Análisis de significación
+
+<br>
+
+Resulta mucho más interesante y fácilmente interpretable estudiar -en vez de los genes uno por uno- que vías metabólicas están diferencialmente expresadas en cada una de las tres comparaciones. Para obtener esta información debemos realizar lo que se conoce como **análisis de significación** o **gene enrichment analysis**. 
+
+<br>
+
+#### Obtención de listas de vías metabólicas diferencialmente expresados
+
+<br>
+
+Aunque no es la única alternativa, el paquete `enrichplot` [@Yu2019] dispone de funciones que nos permiten generar, para cada comparación, tablas que muestran las vías que presentan evidencias significativas de estar diferencialmente expresadas. Estas tablas, a las que nos vamos a referir como **GOtables** o **pathwaytables** contienen -entre otros- el identificador de *Gene Ontology*, una corta descripción (**Description**), la proporción de genes differencialmente expresados (**GeneRatio**), el p-valor (**pvalue**), el p-valor ajustado (**p.adjust**) y el q-valor (**qvalue**) para cada vía. Si ordenamos las vías por p-valor o p-valor ajustado (orden ascendiente), podremos visualizar aquellas con una mayor evidencia de estar diferencialmente expresadas. 
+
+<br>
+
+#### Barplots
+
+<br>
+
+Uno de las modos más clásicos para representar el contenido de las GOtables o pathwaytables consiste en utilizar barplots. Utilizando la función `barplot()` del paquete `graphics` [RCore@2019] directamente sobre el objeto `enrichGO`, podemos generar un gràfico que muestre el número especificado de vías que tienen una mayor evidencia de estar diferencialmente expresadas. A parte de mostrarse el número de genes que forman cada una de estas vías (largo de la barra) también podemos visualizar -mediante una escala de color- el pvalor que indica la evidencia de que esa vía esté realmente diferencialmente expresada.
+
+<br>
+
+#### Cnetplots
+
+<br>
+
+Otra opción muy interesante para representar el contenido de las pathway tables consiste en construir cnetplots mediante la función `cnetplot()` del paquete `enrichplot` [@Yu2019]. Estos gráficos tienen una estructura en forma de red que permite, además de visualizar que vías metabólicas presentan una mayor evidencia de estar diferencialmente expresadas, identificar las conexiones entre genes que pertenecen a más de una vía. Adicionalmente, si así se desea, también permite classificar, mediante una escala de color, aquellos genes que están sobrexpresados o infraexpresados.
+
+<br>
+
+# Resultados
+
+<br>
+
+## Exploración & Preprocesado
+
+<br>
+
+```{r exploration & preprocessing 1, include=F}
+
+subset <- 100
+
+```
+
+En la sección de métodos se ha explicado como eran los datos originales (`counts.csv`, `targets.csv`) y como se ha realizado el subset para obtener únicamente información de `r n_samples` muestras aleatorias. A continuación, se muestran dos tablas: una que contiene la matriz cruda con los *counts* de `r subset`/`r genes` genes para las `r n_samples` muestras seleccionadas (**Tabla 2**) y una con los metadatos de estas muestras (**Tabla 3**). 
+
+<br>
+
+```{r exploration & preprocessing 2, echo=F, warning=F, message=F}
+
+library(knitr)
+library(kableExtra)
+
+counts_raw <- read.csv(file = "data/counts_sub.csv", 
+                       sep = ",", 
+                       header = T, 
+                       row.names = 1, 
+                       stringsAsFactors = F, 
+                       check.names = F) 
+
+kable(x = counts_raw[1:100 , ],
+      format = "html",
+      align = "ccccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, color = "white", background = "#482677FF") %>%
+   scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+**Tabla 2:** tabla que muestra los `r subset` primeros genes de la matriz cruda contenida en el archivo `counts_sub.csv`.
+
+<br>
+
+```{r exploration & preprocessing 3, echo=F, warning=F, message=F}
+
+targets_file <- read.csv(file = "data/targets_sub.csv", 
+                         sep = ",")
+
+kable(x = targets_file,
+      format = "html",
+      align = "ccccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, color = "white", background = "#482677FF") %>%
+   scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+**Tabla 3:** tabla que muestra los metadatos relacionados con las `r n_samples` muestras seleccionadas.
+
+<br>
+
+## Filtrando genes no expresados
+
+<br>
+
+```{r filtering genes 1, include=F}
+
+library(DESeq2)
+
+count_data <- read.csv("data/counts_sub.csv", row.names = 1)
+col_data <- read.csv("data/targets_sub.csv", row.names = 1)
+
+dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                  colData = col_data, 
+                                  design = ~ Group)
+
+dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ]
+dds_filtered_out <- nrow(dds_mat) - nrow(dds_mat_filtered)
+
+```
+
+Una vez creado el objeto `DESeqDataSet`, se ha realizado un filtrado con el objetivo de eliminar aquellos genes que no están expresados en ninguna de las `r n_samples` muestras. Este filtrado ha permitido eliminar `r dds_filtered_out` genes, pasando de `r nrow(dds_mat)` a `r nrow(dds_mat_filtered)`. A continuación se muestran los primeros `r subset` genes de la matriz de *counts* filtrada (**Tabla 4**).
+
+<br>
+
+```{r filtering genes 2, echo=F, warning=F, message=F}
+
+kable(x = counts(dds_mat_filtered)[1:100, ],
+      format = "html",
+      align = "ccccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, color = "white", background = "#482677FF") %>%
+   scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+**Tabla 4:** tabla que muestra los `r subset` primeros genes de la matriz cruda filtrada.
+
+<br>
+
+## Transformación vst
+
+<br>
+
+Préviamente al control de calidad, se ha realizado una **transformación vst** con el objetivo de estabilizar la varianza, reducir el sesgo y normalizar los datos. Podemos visualizar parte del resultado de esta transformación analizando el contenido de la **Tabla 5**, que contiene los `r subset` primeros genes de la matriz de counts normalizada. 
+
+<br>
+
+```{r vst transformation, echo=F, warning=F, message=F}
+
+vsd <- vst(dds_mat_filtered, blind = FALSE)
+
+kable(x = assay(vsd)[1:100, ],
+      format = "html",
+      align = "ccccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, color = "white", background = "#482677FF") %>%
+   scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+**Tabla 6:** tabla que muestra los `r subset` primeros genes de la matriz cruda filtrada y normalizada mediante la transformación vst.
+
+<br>
+
+## Control de calidad
+
+<br>
+
+Ahora que ya disponemos de unos datos con menor sesgo y que están normalizados, ya podemos proseguir con el control de calidad. Tal y como hemos comentado con anterioridad, este control gira principalmente entorno a un análisis gráfico basado la contrucción de un *boxplot*, un *PCA plot* y un *dendrograma*. A continuación se presentan e interpretan conjuntamente los resutados de estas pruebas gráficas. En la **Figura 1** se muestran el *boxplot* y el *PCA plot* esmentados. En primer lugar, observamos que, tal y como se esperaba, la distribución de *pseudocounts* inter e intragrupales del *boxplot* son significativamente homogenéos (**Figura 1.A**). 
+
+<br>
+
+Adicionalmente, si nos fijamos en el *PCA plot* (**Figura 1.B**), podemos extraer bastante información. Por un lado, identificamos que las dos componentes principales que explican mejor la varianza de las muestras explican un 25.7% (*PC1*) y un 10.8 % (*PC2*) de esta. Adicionalmente vemos que -aunque no es perfecta- existe cierta homogeneidad entre las muestras de un mismo grupo. Las muestras del grupo NIT presentan valores negativos y parecidos entre sí para la *PC1* mientras que los valores para la *PC2* son mucho más variables. Las muestras del grupo SFI presentan valores cercanos a 0 y bastante parecidos entre sí para la *PC1* mientras que -análogamente al grupo NIT- los valores para la *PC2* difieren significativamente. Finalmente -a excepción de dos muestras (**ELI-7** y **ELI-9**)- todas las muestras del grupo ELI presentan valores positivos y significativamente elevados para la *PC1*. En cuanto a la *PC2*, observamos una dispersión parecida a la de los otros grupos pero no tan acentuada. En síntesis, podríamos concluir que -aunque no es muy clara- observamos una segmentación de las muestras por grupos. Los grupos NIT y SFI son bastante parecidos entre ellos, mientras que el grupo ELI es el que está más alejado del resto. Si así nos conviene, podríamos considerar las muestras **ELI-7** y **ELI-9** como problemáticas y eliminarlas.
+
+<br>
+
+```{r figura 1, echo=FALSE, message=F, warning=F, fig.dim=c(15, 8)}
+
+library(cowplot)
+
+p1 <- ggdraw() + draw_image("figures/boxplots/pseudocount_raw.tiff", scale = 1, )
+p2 <- ggdraw() + draw_image("figures/PCA_plots/PCA_raw.tiff", scale = 1)
+
+plot_grid(p1, p2, labels = c("A", "B"), label_size = 20)
+
+```
+
+<br>
+
+**Figura 1:** boxplot de los pseudocounts (**A**). PCA plot de los pseudocounts (**B**).
+
+<br>
+
+En la **Figura 2** se muestra el dendrograma. Primeramente, podemos identificar que la división óptima implica la construcción de únicamente dos clústers. El primero incluye todas las muestras NIT, 7/10 muestras SFI y 2/10 muestras ELI. En cambio, el segundo no incluye ninguna muestra NIT, e incluye 3/10 muestras SFI y 8/10 muestras ELI. Estos resultados sustentan lo observado en el *PCA plot*. Esto es -básicamente- que los grupos NIT y SFI son significativamente parecidos entre ellos y -a su vez- considerablemente diferentes al grupo EFI.
+
+<br>
+
+```{r figura 2, echo=FALSE, message=F, warning=F, fig.dim=c(15, 8)}
+
+library(cowplot)
+
+p1 <- ggdraw() + draw_image("figures/dendrograms/dendrogram.tiff", scale = 1, )
+p1
+
+```
+
+<br>
+
+**Figura 2:** dendrograma resultante del análisis de *clustering* jerarárquico de las `r n_samples` muestras.
+
+<br>
+
+## Selección de genes (DEG)
+
+<br>
+
+Una vez los datos han pasado el control de calidad y se han establecido las comparaciones, identificaremos que genes estan diferencialmente expresados en cada una de ellas. A continuación se muestra, para cada una de las 3 comparaciones, una topTable con los 75 genes que parecen presentar una mayor expresión diferencial. Estos son -de los genes que presentan un p-valor ajustado < 0.1- aquellos que presentan valores absolutos más grandes para el log2FC. Adicionalmente, también se muestra un un resumen que contiene -entre otros- el número y el porcentaje de genes *up-regulated* y *down-regulated*.
+
+<br>
+
+**NIT vs SFI:**
+
+<br>
+
+En primer lugar, vamos a analizar los resultados obtenidos para la comparación NIT vs SFI. Tal y como podemos observar en la **Tabla 7**, la aplicación de pequeñas infilitraciones focales en el tejido tiroideo (SFI) desencadena una respuesta que implica -almenos- la expresión diferencial de 330 (0.71%) genes respecto a la condición normal (NIT). De estos genes, 51 (0.11%) están sobrexpresados y 279 (0.6%) infraexpresados.
+
+```{r NIT vs SFI 1, include=F}
+
+dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                  colData = col_data, 
+                                  design = ~ Group)
+
+dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ]
+dds <- DESeq(dds_mat_filtered, parallel = T)
+res_1 <- results(dds, contrast = c("Group","NIT","SFI"))
+
+```
+
+<br>
+
+```{r NIT vs SFI 2, comment=NA, message=F, warning=F, echo=F}
+
+NITvsSFI <- read.csv(file = "results/top_tables_filtered/top_table_NITvsSFI_filtered.csv", 
+                    header = T, 
+                    sep = ",", 
+                    row.names = 1)
+
+NITvsSFI$pvalue <- format(x = NITvsSFI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+NITvsSFI$padj <- format(x = NITvsSFI$padj, 
+                        scientific = T, 
+                        digits = 2)
+
+kable(x = NITvsSFI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "450px")
+
+```
+
+<br>
+
+```{r NIT vs SFI 3, comment=NA, message=F, warning=F, echo=F}
+
+summary(res_1, alpha = 0.1)
+  
+```
+
+<br>
+
+**Tabla 7:** toptable y tabla resumen que contienen tanto la lista como el resumen de los genes que presentan evidencia de estar diferencialmente expresados entre las condiciones NIT y SFI.
+
+<br>
+
+**NIT vs ELI:**
+
+<br>
+
+A continuación, comentaremos el *output* obtenido en la comparación NIT vs ELI. Si nos fijamos en la **Tabla 8**, la aplicación de infilitraciones extensivas en el tejido tiroideo (ELI) desencadena una respuesta que implica -por lo menos- la expresión diferencial de 3814 (8.1%) genes respecto a la condición normal (NIT). De estos genes, un 2% están sobrexpresados y un 6.1% infraexpresados.
+
+
+```{r NIT vs ELI 1, include=F}
+
+res_2 <- results(dds, contrast = c("Group","NIT","ELI"))
+
+```
+
+<br>
+
+```{r NIT vs ELI 2, comment=NA, message=F, warning=F, echo=F}
+
+NITvsELI <- read.csv(file = "results/top_tables_filtered/top_table_NITvsELI_filtered.csv", 
+                    header = T, 
+                    sep = ",", 
+                    row.names = 1)
+
+NITvsELI$pvalue <- format(x = NITvsELI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+NITvsELI$padj <- format(x = NITvsELI$padj, 
+                        scientific = T, 
+                        digits = 2)
+
+kable(x = NITvsELI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "450px")
+
+```
+
+
+<br>
+
+```{r NIT vs ELI 3, comment=NA, message=F, warning=F, echo=F}
+
+summary(res_2, alpha = 0.1)
+  
+```
+
+<br>
+
+**Tabla 8:** toptable y tabla resumen que contienen tanto la lista como el resumen de los genes que presentan evidencia de estar diferencialmente expresados entre las condiciones NIT y ELI.
+
+<br>
+
+**SFI vs ELI:**
+
+<br>
+
+Finalmente, vamos a estudiar que diferencias existen entre la presencia de infilitraciones focales y la presencia de infiltraciones extensivas. Análogamente a las dos comparaciones anteriores, en la **Tabla 9** podemos viusalizar la topTable con los genes diferencialmente expresados entre condiciones y la summaryTable con un resumen del número de genes sobrexpresados e infraexpresados. Observamos que -respecto a la aplcación de infiltraciones focales- la aplicación de infilitraciones extensivas en el tejido tiroideo (ELI) desencadena una respuesta que implica -por lo menos- la expresión diferencial de 3814 (8.1%). De estos genes, un 2% están sobrexpresados y un 6.1% infraexpresados.
+
+```{r SFI vs ELI 1, include=F}
+
+res_3 <- results(dds, contrast = c("Group","SFI", "ELI"))
+
+```
+
+<br>
+
+```{r SFI vs ELI 2, comment=NA, message=F, warning=F, echo=F}
+
+SFIvsELI <- read.csv(file = "results/top_tables_filtered/top_table_SFIvsELI_filtered.csv", 
+                     header = T, 
+                     sep = ",", 
+                     row.names = 1)
+
+SFIvsELI$pvalue <- format(x = SFIvsELI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+SFIvsELI$padj <- format(x = SFIvsELI$padj, 
+                        scientific = T, 
+                        digits = 2)
+
+kable(x = NITvsSFI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "450px")
+
+```
+
+<br>
+
+```{r SFI vs ELI 3, comment=NA, message=F, warning=F, echo=F}
+
+summary(res_3, alpha = 0.1)
+  
+```
+
+<br>
+
+**Tabla 9:** toptable y tabla resumen que contienen tanto la lista como el resumen de los genes que presentan evidencia de estar diferencialmente expresados entre las condiciones SFI y ELI.
+
+<br>
+
+Las tablas de genes diferencialmente expresados (conocidas también como topTables) tienen la misma debilidad y el mismo punto fuerte: contienen demasiada información. Una alternativa más visual para identificar cuan diferencialmente expresados están los genes de cada comparación es mediante  el uso de **volcano plots**. A continuación se muestran los volcano plots para cada una de las 3 comparaciones (**Figura 3**). Para facilitar su interpretación se han añadido una línea horizontal con el fdr *cutoff* (FDR = 0.1), dos líneas verticales con los foldChange *cutoffs* (FC = -2, 2) y una leyenda de colores (NS = gris, log2FC = verde, p-value = azul, p-value & log2FC = rojo). 
+
+<br>
+
+En línea con lo observado en las topTables y las summaryTables, los volcano plots parecen indicar que las comparaciones que presentan una mayor variación en su expresión son NITvsELI y SFIvsELI. Visto de otro modo, esto sugiere que la aplicación de infiltraciones focales no tiene un efecto demasiado significativo respecto al control. Estos resultados secundan el patrón que observamos en el PCA plot de los datos normalizados (**Figura 1**).
+
+<br>
+
+```{r volcano plots, echo=F, fig.dim=c(14, 14)}
+
+p1 <- ggdraw() + draw_image("figures/volcano_plots/volcano_plot_NITvsSFI.tiff", scale = 1)
+p2 <- ggdraw() + draw_image("figures/volcano_plots/volcano_plot_NITvsELI.tiff", scale = 1)
+p3 <- ggdraw() + draw_image("figures/volcano_plots/volcano_plot_SFIvsELI.tiff", scale = 1)
+
+
+plot_grid(p1, p2, p3, ncol = 2, nrow = 2, labels = "AUTO", label_size = 20)
+
+```
+
+<br>
+
+**Figura 3:** volcano plots resultantes de las comparaciones entre los grupos NIT, SFI (A), NIT y ELI (B) y SFI y ELI (C). Se consideran diferencialmente expresados los genes que corresponden a los puntos de color rojo.
+
+<br>
+
+## Análisis de significación
+
+<br>
+
+Aunque ya conocemos que genes están sobrexpresados o infraexpresados en cada de las comparaciones, es difícil extraer conclusiones a partir de esta información. Con el objetivo de obtener una visión más general e identificar que vías metabólicas se ven modificadas por la presencia y grado de infiltraciones en el tejido tiroideo, podemos realizar un **análisis de significación** o **de pathways**. Este tipo de análisis permiten clasificar y agrupar los genes diferencialmente expresados dentro de las vías metabólicas en las que participan. A continuación se muestra, para cada dieta, una tabla que contiene los resultados de este análisis (**Tablas 10-12**). 
+
+<br>
+
+**NIT vs SFI:**
+
+<br>
+
+```{r pathway analysis NIT vs SFI 1, comment=NA, echo=F, message=F, warning=F}
+
+NITvsSFI <- read.csv(file = "results/GO_tables/GO_table_NITvsSFI.csv", 
+                     sep = ",", 
+                     row.names = 1)
+
+NITvsSFI <- NITvsSFI[ , -1]
+
+NITvsSFI$pvalue <- format(x = NITvsSFI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+NITvsSFI$p.adjust <- format(x = NITvsSFI$p.adjust, 
+                            scientific = T, 
+                            digits = 2)
+
+NITvsSFI$qvalue <- format(x = NITvsSFI$qvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+kable(x = NITvsSFI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "300px")
+  
+```
+
+<br>
+
+**Tabla 10:** GOtable que contiene las vías metabólicas expresadas diferencialmente entre los grupos NIT y SFI.
+
+<br>
+
+**NIT vs ELI:**
+
+<br>
+
+```{r pathway analysis NIT vs ELI 1, comment=NA, echo=F, message=F, warning=F}
+
+NITvsELI <- read.csv(file = "results/GO_tables/GO_table_NITvsELI.csv", 
+                     sep = ",", 
+                     row.names = 1)
+
+NITvsELI <- NITvsELI[ , -1]
+
+NITvsELI$pvalue <- format(x = NITvsELI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+NITvsELI$p.adjust <- format(x = NITvsELI$p.adjust, 
+                            scientific = T, 
+                            digits = 2)
+
+NITvsELI$qvalue <- format(x = NITvsELI$qvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+kable(x = NITvsELI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+<br>
+
+**Tabla 11:** GOtable que contiene las vías metabólicas expresadas diferencialmente entre los grupos NIT y ELI.
+
+<br>
+
+**SFI vs ELI:**
+
+<br>
+
+```{r pathway analysis SFI vs ELI 1, comment=NA, echo=F, message=F, warning=F}
+
+SFIvsELI <- read.csv(file = "results/GO_tables/GO_table_SFIvsELI.csv", 
+                     sep = ",", 
+                     row.names = 1)
+
+SFIvsELI <- SFIvsELI[ , -1]
+
+SFIvsELI$pvalue <- format(x = SFIvsELI$pvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+SFIvsELI$p.adjust <- format(x = SFIvsELI$p.adjust, 
+                            scientific = T, 
+                            digits = 2)
+
+SFIvsELI$qvalue <- format(x = SFIvsELI$qvalue, 
+                          scientific = T, 
+                          digits = 2)
+
+kable(x = SFIvsELI, 
+      format = "html",
+      align = "ccccccc", 
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                font_size = 12, 
+                fixed_thead = T) %>%
+  row_spec(0, bold = T, 
+           color = "white", background = "#482677FF") %>%
+  collapse_rows(1, valign = "middle") %>%
+  scroll_box(width = "100%", height = "300px")
+
+```
+
+<br>
+
+**Tabla 12:** GOtable que contiene las vías metabólicas expresadas diferencialmente entre los grupos SFI y ELI.
+
+<br>
+
+De forma análoga a las toptables, las pathwaytables o GOtables también contienen demasiada información. Una solución mucho más visual consiste en construir un **barplot** y un **cnetplot** para cada una de las comparaciones. A continuación se muestran los barplots (**Figura 4**) y los cnetplots (**Figura 5**) corresondientes a cada una de las tablas que se acaban de presentar. En el caso de los barplots, las barras están ordenadas de mayor a menor evidencia de que esa vía este diferencialmente expresada.
+
+<br>
+
+```{r pathway analysis global 1, comment=NA, echo=F, message=F, warning=F, fig.dim=c(16, 28)}
+
+p1 <- ggdraw() + draw_image("figures/bar_plots/bar_plot_NITvsSFI.tiff", scale = 1.03)
+p2 <- ggdraw() + draw_image("figures/bar_plots/bar_plot_NITvsELI.tiff", scale = 1.1)
+p3 <- ggdraw() + draw_image("figures/bar_plots/bar_plot_SFIvsELI.tiff", scale = 1.1)
+
+plot_grid(p1, p2, p3, ncol = 1, nrow = 3, labels = "AUTO", label_size = 20)
+
+```
+
+<br>
+
+**Figura 4:** barplots que muestran las 10 vías metabólicas con mayor evidencia de estar diferencialmente expresadas en las comparaciones NIT-SFI (**A**), NIT-ELI (**B**) y SFI-ELI (**C**).
+
+<br>
+
+```{r pathway analysis global 2, comment=NA, echo=F, message=F, warning=F, fig.dim=c(15, 15)}
+
+p1 <- ggdraw() + draw_image("figures/cnet_plots/cnet_plot_NITvsSFI.tiff", scale = 1)
+p2 <- ggdraw() + draw_image("figures/cnet_plots/cnet_plot_NITvsELI.tiff", scale = 1)
+p3 <- ggdraw() + draw_image("figures/cnet_plots/cnet_plot_SFIvsELI.tiff", scale = 1)
+
+plot_grid(p1, p2, p3, ncol = 2, nrow = 2, labels = "AUTO", label_size = 20)
+
+```
+
+<br>
+
+**Figura 5:** cnetplots que muestran las 4 vías metabólicas con mayor evidencia de estar diferencialmente expresadas en las comparaciones NIT-SFI (**A**), NIT-ELI (**B**) y SFI-ELI (**C**).
+
+<br>
+
+Para comentar y analizar estos resultados obtenidos, lo haremos comparación a comparación. Empezaremos -pues- por la comparación NIT-SFI. Si nos fijamos en los *outputs* de la GOtable (**Tabla 10**), el barplot  (**Figura 4.A**) y el cnetplot (**Figura 5.A**) podemos identificar que las 4 rutas metabólicas que tienen una mayor evidencia de estar parcialmente diferencialmente expresadas están relacionadas con la respuesta inmune. En concreto estas vías están implicadas en la activación, señalización y la proliferación de los limfocitos B y en la respuesta inmune de tipo humoral. Adicionalmente es importante remarcar que la cantidad de genes diferencialmente expresados entre conidiciones oscila alrededor de 10 por vía y que todos estos genes se encuentran infraexpresados para la condición SFI.
+
+<br>
+
+Sigamos con la comparación NIT-ELI (**Tabla 11**, **Figura 4.B**, **Figura 5.B**). Analizando los resultados generados, identificamos que las 4 rutas con una mayor evidencia de estar diferencialmente expresadas también están relacionadas con la respuesta inmune. Sin embargo, esta vez las vías están más ligadas a los limfocitos T que a los B. Concretamente, las vías afectadas tienen relación con la activación y diferenciación de los limfocitos T aunque también de otro tipo de limfocitos. Para cada una de estas vías el número de genes diferencialmente expresados oscila entre 58 y 94. Otro hecho que podemos observar y que es muy interesante, es que todos estos genes están infraexpresados en la condición EFI menos tres (**TAC1**, **IHH**, **IL6**).
+
+<br>
+
+Finalmente, para la comparación SFI-ELI (**Tabla 12**, **Figura 4.C**, **Figura 5.C**) vemos que 2 de las 4 rutas con una mayor evidencia de estar diferencialmente expresadas son las mismas que vimos para la comparación NIT-ELI. En cuanto a las otras dos, estas tienen una relación muy estrecha con las que se observaron para la comparación anterior. Las vías afectadas están relacionadas con la activación de los limfocitos T y con la activación y regulación de otros limfocitos. El número de genes afectados para cada una de estas vías se mueve dentro del intervalo [48, 61]. Además, si miramos el cnetplot podemos ver que -de nuevo- sólo tres genes están sobrexpresados (**IGF1**, **IL6**, **TAC1**), estando dos de ellos compartidos con la comparación anterior.
+
+<br>
+
+# Discusión
+
+<br>
+
+En cualquier proyecto de investigación, la discusión de los resultados y la extracción de conclusiones requieren de un conocimiento exhaustivo del contexto biológico del estudio. Sin embargo, obtener el grado adecuado de este conocimiento puede implicar meses o años realizando investigación en una misma dirección. Por ese motivo, con mucha frecuencia, el papel del bioinformático pasa a un segundo plano en esta parte del proceso de investigación. Su papel, pues, consiste básicamente en ofrecer soporte al resto del equipo, generar un informe con los resultados y, dentro de lo posible, comentarlos. Aunque en la sección de resultados ya hemos realizado una breve discusión de estos, hemos decidido presentar -a continuación- una valoración general.
+
+<br>
+
+A diferencia de la PEC 1, donde nos intentamos basar en los métodos propuestos por el personal docente, en este caso hemos intendado improvisar un poco y utilizar aquellas pruebas/análisis y aquellos paquetes/librerías que más nos han convenido. Aunque no es mi intención utilizar esto como excusa, debido a temas laborales que han implicado emigrar a otro país, para algunos de los análisis hemos utilizado paquetes que -a priori- pueden parecer relativamente antiguos. La velocidad con la que avanzan las diferentes ramas de la bioinformática y la aparición constante de nuevos paquetes sumada a la falta de tiempo ha hecho que hayamos intendado simplificar el *workflow* de análisis.
+
+<br>
+
+A pesar de todo lo comentado anteriormente, hemos obtenido unos resultados que podemos considerar -como mínimo- interesantes. A continuación pasamos a comentarlos. Según los datos obtenidos, la expresión diferencial entre las condiciones NIT (control) y SFI (infilitraciones focales) es poco significativa. La aplicación de infilitraciones focales en el tejido tiroide afecta solo a un 0.71% de los genes, estando un 0.11% de ellos sobrexpresados y un 0.6% infraexpresados (**Tabla 7, Figura 3.A**). En contraste, si nos fijamos en las dos otras comparaciones, observamos que la aplicación de infiltraciones extensivas provoca una expresión diferencial significativa. Respecto al control, esta aplicación afecta la expresión de un 8.1% de los genes, estando un 2% sobrexpresados y un 6.1% infraexpresados. En cambio, respecto al grupo con infiltraciones focales, vemos que esta aplicación afecta la expresión del 8.9% de los genes. En síntonia con lo observado para la comparación NIT vs SFI, la mayoría de estos genes están infraexpresados (6.1% frente a 2.8%). Los volcano plots secundan estas conclusiones y nos permiten asimilar estas ideas de forma más visual. 
+
+<br>
+
+Aunque los resultados que acabamos de presentar son muy interesantes y válidos, para sacar conclusiones es más conveniente traducir estos resultados de genes a vías metabólicas diferencialmente expresadas. La generación de pathwaytables y -a partir de estas- de barplots y cnetplots revela que en cualquiera de las tres comparaciones las vías metabólicas afectadas tienen relación con la respuesta inmune. Más concretamente con la activación, proliferación y diferenciación de los limfocitos B y T. Es importante destacar que para la comparación NIT-SFI, la mayoría de genes afectados están más relacionados con los limfocitos B mientras que para las otras dos comparaciones lo están para los T. Adicionalmente, como ya hemos visto anteriormente, casi todos los genes están infraexpresados. Sin embargo, para las comparaciones NIT-ELI y SFI-ELI, tres genes están sobrexpresados. Estos son **IL6** y **TAC1** (compartidos) y **IGF1** (SFI-ELI) o **RUNX3** (NIT-ELI). En consecuencia, podría ser interesante ver que función tienen estos genes y porque están sobrexpresados.
+
+<br>
+
+En síntesi, la aplicación de infiltraciones focales en el tejido tiroideo tienen un efecto significativamente leve sobre la respuesta inmune, provocando la infraexpresión de un número pequeño de genes. Sin embargo, la aplicación de inflitraciones extensivas tiene un efecto mucho más potente, provocando la infraexpresión de un número mucho más considerable de genes relacionados también con la respuesta inmune. Finalmente, si comparamos el grupo con extensiones focales y extensivas obtenemos unos resultados muy parecidos a los obtenidos entre el control y el segundo grupo. 
+
+<br>
+
+# Annexo
+
+<br>
+
+A continuación se muestra todo el código que hemos utilizado para este análisis. Este contenido es idéntico a aquel presente dentro del script `Garcia_Marc_ADO_PEC2.R`.
+
+<br>
+
+```{r annex, eval=F, message=F, warning=F}
+
+# PEC2: Análisis de Datos Ómicos
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Estableciendo el directorio de trabajo
+
+setwd("C:/Users/USER/Documents/Màster Bioestadística i Bioinfo/Análisis de datos Ómicos/PECS/ADO_PEC2_Marc_Garcia/")
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Preparando el entorno de trabajo 
+
+dir.create("data")
+dir.create("scripts")
+dir.create("results")
+dir.create("other")
+dir.create("figures")
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Carga de paquetes
+
+# 1) CRAN
+
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(magrittr)
+library(cowplot)
+library(cluster)
+library(factoextra)
+
+# 2) Bioconductor
+
+library(Biobase)
+library(DESeq2)
+library(AnnotationDbi)
+library(EnhancedVolcano)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ReactomePA)
+library(enrichplot)
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Cargando los datos
+
+counts_raw <- read.csv(file = "data/counts.csv", 
+                       sep = ";", 
+                       header = T, 
+                       row.names = 1, 
+                       stringsAsFactors = F, 
+                       check.names = F) 
+
+targets_file <- read.csv(file = "data/targets.csv", 
+                         sep = ",")
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Exploración raw counts + targets file
+
+# 1) Raw counts
+
+dim(counts_raw)                                                                       
+View(counts_raw)                                                                      
+head(counts_raw[ , 1:4], 8)                                                           
+
+# 2) Targets
+
+dim(targets_file)                                                                     
+View(targets_file)                                                                    
+head(targets_file, 10)                                                                
+
+# ----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Preprocesado de los datos
+
+# 1) Selección de las muestras
+
+targets_file_nit <- targets_file[targets_file$Group == "NIT", ]                       
+targets_file_sfi <- targets_file[targets_file$Group == "SFI", ]                       
+targets_file_eli <- targets_file[targets_file$Group == "ELI", ]                       
+
+sample_names_nit <- as.character(targets_file_nit$Sample_Name)                        
+sample_names_sfi <- as.character(targets_file_sfi$Sample_Name)                        
+sample_names_eli <- as.character(targets_file_eli$Sample_Name)                        
+
+set.seed(65261)                                                                         
+nit_subset <- sample(x = sample_names_nit, size = 10, replace = F)                     
+sfi_subset <- sample(x = sample_names_sfi, size = 10, replace = F)                    
+eli_subset <- sample(x = sample_names_eli, size = 10, replace = F)                    
+selected_samples <- c(nit_subset, sfi_subset, eli_subset)                             
+
+# 2) Subsetting
+
+# 2.1) Counts
+
+counts_raw_sub <- counts_raw[ , selected_samples]                                     
+
+# 2.2) Targets
+
+rownames(targets_file) <- targets_file$Sample_Name                                    
+targets_raw_sub <- targets_file[selected_samples, ]
+
+# 3) Cambio de nombre de las muestras
+
+colnames(counts_raw_sub)[1:10] <- paste0("NIT_", 1:10)                                
+colnames(counts_raw_sub)[11:20] <- paste0("SFI_", 1:10)                               
+colnames(counts_raw_sub)[21:30] <- paste0("ELI_", 1:10)                               
+rownames(targets_raw_sub) <- colnames(counts_raw_sub)
+targets_raw_sub$color <- c(rep("#238A8DFF", 10), rep("#DCE319FF", 10), rep("#481567FF", 10))
+
+# 4) Comprobaciones
+
+head(counts_raw_sub[1:17], 10)
+colnames(counts_raw_sub)
+rownames(targets_raw_sub)
+
+# 5) Guardando los subsets
+
+# 5.1) Counts
+
+write.csv(x = counts_raw_sub, 
+          file = "data/counts_sub.csv", 
+          row.names = T)
+
+# 5.2) Targets
+
+write.csv(x = targets_raw_sub, 
+          file = "data/targets_sub.csv", 
+          row.names = T)
+  
+# ----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Construcción de un objeto DESeq dataset
+
+count_data <- read.csv("data/counts_sub.csv", row.names = 1)
+col_data <- read.csv("data/targets_sub.csv", row.names = 1)
+
+(dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                   colData = col_data, 
+                                   design = ~ Group))
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Eliminando genes no expresados
+
+(dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ])
+filtered_out <- nrow(dds_mat) - nrow(dds_mat_filtered)
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Transformación vst
+
+vsd <- vst(object = dds_mat_filtered, blind = FALSE)
+head(assay(vsd), 10)[ , 1:10]
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Control de calidad
+
+# 1) Boxplot
+
+dir.create("figures/boxplots")
+
+(g1 <- ggplot(stack(data.frame(assay(vsd))), aes(x = ind, y = values, fill = ind)) +
+  geom_boxplot() +
+  scale_fill_manual(values = targets_raw_sub$color) +
+    labs(title = "Boxplot transformed counts", 
+         x = "muestra", 
+         y = "pseudocounts") +
+    theme_classic() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1)) +
+    theme(axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0)),
+          axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0))))
+
+tiff("figures/boxplots/pseudocount_raw.tiff", 
+     res = 300, 
+     width = 5.5, 
+     height = 5.5, 
+     units = 'in', 
+     bg = NA)
+
+print(g1)
+
+dev.off()
+
+# 2) PCA plot
+
+plotPCA3 <- function (datos, labels, factor, title, scale, size = 1.5, glineas = 0.25) {
+  
+  data <- prcomp(t(datos), scale = scale)
+  
+  # plot adjustments
+  
+  dataDf <- data.frame(data$x)
+  Group <- factor
+  loads <- round(data$sdev^2/sum(data$sdev^2) * 100, 1)
+  
+  # main plot
+  
+  p1 <- ggplot(data = dataDf, aes(x = PC1, y = PC2)) +
+    theme_classic() +
+    geom_hline(yintercept = 0, color = "gray70") +
+    geom_vline(xintercept = 0, color = "gray70") +
+    geom_point(aes(color = Group), size = 2) +
+    coord_cartesian(xlim = c(min(data$x[ , 1]) - 5, max(data$x[ , 1]) + 5)) +
+    scale_fill_discrete(name = "Group") +
+    theme(axis.title.y = element_text(size = 10,
+                                      margin = margin(t = 0, r = 10, b = 0, l = 0)),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, r = 0, b = 0, l = 0)),
+          axis.text = element_text(size = 7), 
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 10),
+          legend.key.size = unit(0.4, "cm"),
+          legend.key.width = unit(0.5,"cm")) 
+  
+  # avoiding labels superposition
+  
+  p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels), segment.size = 0.25, size = size) + 
+    labs(x = c(paste("PC1", loads[1], "%")), y = c(paste("PC2", loads[2], "%"))) +  
+    ggtitle(paste("PCA for: ", title, sep = " ")) + 
+    scale_color_viridis(discrete = T)
+}
+
+dir.create("figures/PCA_plots")
+
+tiff("figures/PCA_plots/PCA_raw.tiff", 
+       res = 300, 
+       width = 5.5, 
+       height = 5.5, 
+       units = 'in', 
+       bg = NA)
+  
+print(plotPCA3(datos = assay(vsd), 
+                 labels = colnames(counts_raw_sub), 
+                 factor = targets_raw_sub$Group, 
+                 title = "transformed counts", 
+                 scale = F, 
+                 size = 2.5))
+
+dev.off()
+
+# 3) Dendrograma
+
+sample_dist <- dist(t(assay(vsd)))
+res <- hcut(sample_dist, k = 2, stand = T, method = "euclidean")
+res$labels <- as.character(colnames(dds_mat_filtered))
+
+dir.create("figures/dendrograms")
+
+tiff("figures/dendrograms/dendrogram.tiff", 
+     res = 300, 
+     width = 10, 
+     height = 5.5, 
+     units = 'in', 
+     bg = NA)
+
+print(fviz_dend(res, 
+                rect = T, 
+                cex = 0.5, 
+                lwd = 1, 
+                k_colors = c("#440154FF", "#FDE725FF"), 
+                label_cols = "black"))
+
+dev.off()
+
+# -------------------------------------------------------------------------------------------------------------------------
+
+# Selección de genes diferencialmente expresados (DEG) 
+
+# 1) Construyendo DESeq2DataSet
+
+dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                  colData = col_data, 
+                                  design = ~ Group)
+
+# 2) Filtrando genes que cierta expresión
+
+dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ]
+
+# 3) Creación de objeto DESeq
+
+dds <- DESeq(dds_mat_filtered, parallel = T)
+
+# 4) Contrastes
+
+# 4.1) NIT vs SFI
+
+# 4.1.1) Generando resultados contraste
+
+res_1 <- results(dds, contrast = c("Group","NIT","SFI"))
+
+# 4.1.2) Modificando los ENSEMBL gene ids
+
+rownames(res_1) <- gsub("\\..*","", rownames(res_1))
+
+# 4.1.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_1 <- summary(res_1, alpha = 0.1)
+
+# 4.1.4) Anotando DEG (genesymbol + entrezid)
+
+res_1$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_1), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_1$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_1),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.1.5) Eliminando genes que no tienen anotación
+
+res_1 <- na.omit(res_1)
+
+# 4.1.6) Guardando el contenido de la toptable
+
+dir.create("results/top_taples")
+
+write.csv(x = res_1, 
+          file = "results/top_taples/top_table_NITvsSFI.csv", 
+          row.names = T)
+
+# 4.1.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_1_filtered <- as.data.frame(res_1)[which(res_1$padj < 0.1 & abs(res_1$log2FoldChange) > 2), ]
+res_1_filtered <- res_1_filtered[order(res_1_filtered$padj), ]
+View(res_1_filtered)
+
+# 4.1.8) Guardando el contenido de la toptable filtrada
+
+dir.create("results/top_tables_filtered")
+
+write.csv(x = res_1_filtered, 
+          file = "results/top_tables_filtered/top_table_NITvsSFI_filtered.csv", 
+          row.names = T)
+
+# 4.1.9) Volcano plot
+
+dir.create("figures/volcano_plots")
+
+tiff(filename = "figures/volcano_plots/volcano_plot_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_1, 
+                      lab = res_1$symbol,
+                      selectLab = res_1$symbol[order(res_1$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 7), 
+                      xlim = c(-7, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "NIT vs SFI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.1.10) heatmap
+
+dir.create("figures/heatmaps")
+
+h_res_1 <- as.matrix(counts_raw_sub[rownames(res_1_filtered), 1:20])
+rownames(h_res_1) <- res_1_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_1)
+
+dev.off()
+
+# 4.2) NIT vs ELI
+
+# 4.2.1) Generando resultados contraste
+
+res_2 <- results(dds, contrast = c("Group", "NIT", "ELI"))
+
+# 4.2.2) Modificando los ENSEMBL gene ids
+
+rownames(res_2) <- gsub("\\..*","", rownames(res_2))
+
+# 4.2.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_1 <- summary(res_2, alpha = 0.1)
+
+# 4.2.4) Anotando DEG
+
+res_2$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_2), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_2$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_2),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.2.5) Eliminando genes que no tienen anotación
+
+res_2 <- na.omit(res_2)
+
+# 4.2.6) Guardando el contenido de la toptable
+
+write.csv(x = res_2, 
+          file = "results/top_taples/top_table_NITvsELI.csv", 
+          row.names = T)
+
+# 4.2.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_2_filtered <- as.data.frame(res_2)[which(res_2$padj < 0.1 & abs(res_2$log2FoldChange) > 2), ]
+res_2_filtered <- res_2_filtered[order(res_2_filtered$padj), ]
+View(res_2_filtered)
+
+# 4.2.8) Guardando contenido de la toptable filtrada
+
+write.csv(x = res_2_filtered, 
+          file = "results/top_tables_filtered/top_table_NITvsELI_filtered.csv", 
+          row.names = T)
+
+# 4.2.9) Volcano plot
+
+tiff(filename = "figures/volcano_plots/volcano_plot_NITvsELI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_2, 
+                      lab = res_2$symbol,
+                      selectLab = res_2$symbol[order(res_2$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 30), 
+                      xlim = c(-10, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "NIT vs ELI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.2.10) heatmap
+
+h_res_2 <- as.matrix(counts_raw_sub[rownames(res_2_filtered), 1:20])
+rownames(h_res_2) <- res_2_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_2)
+
+dev.off()
+
+# 4.3) SFI vs ELI
+
+# 4.3.1) Generando resultados contraste
+
+res_3 <- results(dds, contrast = c("Group", "SFI", "ELI"))
+
+# 4.3.2) Modificando los ENSEMBL gene ids
+
+rownames(res_3) <- gsub("\\..*","", rownames(res_3))
+
+# 4.3.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_3 <- summary(res_3, alpha = 0.1)
+
+# 4.3.4) Anotando DEG
+
+res_3$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_3), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_3$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_3),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.3.5) Eliminando genes que no tienen anotación
+
+res_3 <- na.omit(res_3)
+
+# 4.3.6) Guardando el contenido de la toptable
+
+write.csv(x = res_3, 
+          file = "results/top_taples/top_table_SFIvsELI.csv", 
+          row.names = T)
+
+# 4.3.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_3_filtered <- as.data.frame(res_3)[which(res_3$padj < 0.1 & abs(res_3$log2FoldChange) > 2), ]
+res_3_filtered <- res_3_filtered[order(res_3_filtered$padj), ]
+View(res_filtered)
+
+# 4.3.8) Guardando contenido de la toptable filtrada
+
+write.csv(x = res_3_filtered, 
+          file = "results/top_tables_filtered/top_table_SFIvsELI_filtered.csv", 
+          row.names = T)
+
+# 4.3.9) Volcano plot
+
+tiff(filename = "figures/volcano_plots/volcano_plot_SFIvsELI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_3, 
+                      lab = res_3$symbol,
+                      selectLab = res_3$symbol[order(res_3$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 15), 
+                      xlim = c(-10, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "SFI vs ELI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.3.10) heatmap
+
+h_res_3 <- as.matrix(counts_raw_sub[rownames(res_3_filtered), 1:20])
+rownames(h_res_3) <- res_3_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_3)
+
+legend("topright",     
+       legend = c("NIT", "SFI"), 
+       col = c("royalblue3","goldenrod"),
+       lty = 1,
+       lwd = 10)
+
+dev.off()
+
+# -------------------------------------------------------------------------------------------------------------------------
+
+# Análisis de significación (gene enrichment analysis)
+
+# 1) NIT vs SFI
+
+dir.create("results/GO_tables")
+dir.create("figures/cnet_plots")
+dir.create("figures/bar_plots")
+
+entrez_res_1 <- res_1_filtered$entrez
+
+res_1_enriched <- enrichGO(gene = entrez_res_1,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, 
+                           qvalueCutoff = 0.05,
+                           readable = TRUE)
+
+GO_table_res_1 <- as.data.frame(res_1_enriched@result)[ , 1:7]
+GO_table_res_1 <- GO_table_res_1[GO_table_res_1$p.adjust < 0.05 & GO_table_res_1$qvalue < 0.05, ]
+View(GO_table_res_1)
+
+write.csv(x = GO_table_res_1, 
+          file = "results/GO_tables/GO_table_NITvsSFI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_NITvsSFI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_1_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_1_filtered$log2FoldChange[res_1_filtered$padj < 0.05]
+names <- res_1_filtered$symbol[res_1_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_NITvsSFI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_1_enriched, 
+         node_label = "all", 
+         showCategory = 5, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()
+
+# 2) NIT vs ELI
+
+entrez_res_2 <- res_2_filtered$entrez
+
+res_2_enriched <- enrichGO(gene = entrez_res_2,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, 
+                           qvalueCutoff = 0.05,
+                           readable = TRUE)
+
+GO_table_res_2 <- as.data.frame(res_2_enriched@result)[ , 1:7]
+GO_table_res_2 <- GO_table_res_2[GO_table_res_2$p.adjust < 0.05 & GO_table_res_2$qvalue < 0.05, ]
+View(GO_table_res_2)
+
+write.csv(x = GO_table_res_2, 
+          file = "results/GO_tables/GO_table_NITvsELI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_NITvsELI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_2_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_2_filtered$log2FoldChange[res_2_filtered$padj < 0.05]
+names <- res_2_filtered$symbol[res_2_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_NITvsELI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_2_enriched, 
+         node_label = "all", 
+         showCategory = 4, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()
+
+# 3) SFI vs ELI
+
+entrez_res_3 <- res_3_filtered$entrez
+
+res_3_enriched <- enrichGO(gene = entrez_res_3,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.15,
+                           readable = TRUE)
+
+GO_table_res_3 <- as.data.frame(res_3_enriched@result)[ , 1:7]
+GO_table_res_3 <- GO_table_res_3[GO_table_res_3$p.adjust < 0.05 & GO_table_res_3$qvalue < 0.05, ]
+View(GO_table_res_3)
+
+write.csv(x = GO_table_res_3, 
+          file = "results/GO_tables/GO_table_SFIvsELI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_SFIvsELI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_3_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_3_filtered$log2FoldChange[res_3_filtered$padj < 0.05]
+names <- res_3_filtered$symbol[res_3_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_SFIvsELI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_3_enriched, 
+         node_label = "all", 
+         showCategory = 4, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()
+
+```
+
+<br>
+
+# Referencias
+
+<br>

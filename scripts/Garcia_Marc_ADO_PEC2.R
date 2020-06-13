@@ -1,0 +1,744 @@
+# PEC2: Análisis de Datos Ómicos
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Estableciendo el directorio de trabajo
+
+setwd("C:/Users/USER/Documents/Màster Bioestadística i Bioinfo/Análisis de datos Ómicos/PECS/ADO_PEC2_Marc_Garcia/")
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Preparando el entorno de trabajo 
+
+dir.create("data")
+dir.create("scripts")
+dir.create("results")
+dir.create("other")
+dir.create("figures")
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Carga de paquetes
+
+# 1) CRAN
+
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(magrittr)
+library(cowplot)
+library(cluster)
+library(factoextra)
+
+# 2) Bioconductor
+
+library(Biobase)
+library(DESeq2)
+library(AnnotationDbi)
+library(EnhancedVolcano)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ReactomePA)
+library(enrichplot)
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Cargando los datos
+
+counts_raw <- read.csv(file = "data/counts.csv", 
+                       sep = ";", 
+                       header = T, 
+                       row.names = 1, 
+                       stringsAsFactors = F, 
+                       check.names = F) 
+
+targets_file <- read.csv(file = "data/targets.csv", 
+                         sep = ",")
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Exploración raw counts + targets file
+
+# 1) Raw counts
+
+dim(counts_raw)                                                                       
+View(counts_raw)                                                                      
+head(counts_raw[ , 1:4], 8)                                                           
+
+# 2) Targets
+
+dim(targets_file)                                                                     
+View(targets_file)                                                                    
+head(targets_file, 10)                                                                
+
+# ----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Preprocesado de los datos
+
+# 1) Selección de las muestras
+
+targets_file_nit <- targets_file[targets_file$Group == "NIT", ]                       
+targets_file_sfi <- targets_file[targets_file$Group == "SFI", ]                       
+targets_file_eli <- targets_file[targets_file$Group == "ELI", ]                       
+
+sample_names_nit <- as.character(targets_file_nit$Sample_Name)                        
+sample_names_sfi <- as.character(targets_file_sfi$Sample_Name)                        
+sample_names_eli <- as.character(targets_file_eli$Sample_Name)                        
+
+set.seed(65261)                                                                         
+nit_subset <- sample(x = sample_names_nit, size = 10, replace = F)                     
+sfi_subset <- sample(x = sample_names_sfi, size = 10, replace = F)                    
+eli_subset <- sample(x = sample_names_eli, size = 10, replace = F)                    
+selected_samples <- c(nit_subset, sfi_subset, eli_subset)                             
+
+# 2) Subsetting
+
+# 2.1) Counts
+
+counts_raw_sub <- counts_raw[ , selected_samples]                                     
+
+# 2.2) Targets
+
+rownames(targets_file) <- targets_file$Sample_Name                                    
+targets_raw_sub <- targets_file[selected_samples, ]
+
+# 3) Cambio de nombre de las muestras
+
+colnames(counts_raw_sub)[1:10] <- paste0("NIT_", 1:10)                                
+colnames(counts_raw_sub)[11:20] <- paste0("SFI_", 1:10)                               
+colnames(counts_raw_sub)[21:30] <- paste0("ELI_", 1:10)                               
+rownames(targets_raw_sub) <- colnames(counts_raw_sub)
+targets_raw_sub$color <- c(rep("#238A8DFF", 10), rep("#DCE319FF", 10), rep("#481567FF", 10))
+
+# 4) Comprobaciones
+
+head(counts_raw_sub[1:17], 10)
+colnames(counts_raw_sub)
+rownames(targets_raw_sub)
+
+# 5) Guardando los subsets
+
+# 5.1) Counts
+
+write.csv(x = counts_raw_sub, 
+          file = "data/counts_sub.csv", 
+          row.names = T)
+
+# 5.2) Targets
+
+write.csv(x = targets_raw_sub, 
+          file = "data/targets_sub.csv", 
+          row.names = T)
+  
+# ----------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Construcción de un objeto DESeq dataset
+
+count_data <- read.csv("data/counts_sub.csv", row.names = 1)
+col_data <- read.csv("data/targets_sub.csv", row.names = 1)
+
+(dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                   colData = col_data, 
+                                   design = ~ Group))
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Eliminando genes no expresados
+
+(dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ])
+filtered_out <- nrow(dds_mat) - nrow(dds_mat_filtered)
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Transformación vst
+
+vsd <- vst(object = dds_mat_filtered, blind = FALSE)
+head(assay(vsd), 10)[ , 1:10]
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+# Control de calidad
+
+# 1) Boxplot
+
+dir.create("figures/boxplots")
+
+(g1 <- ggplot(stack(data.frame(assay(vsd))), aes(x = ind, y = values, fill = ind)) +
+  geom_boxplot() +
+  scale_fill_manual(values = targets_raw_sub$color) +
+    labs(title = "Boxplot transformed counts", 
+         x = "muestra", 
+         y = "pseudocounts") +
+    theme_classic() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1)) +
+    theme(axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0)),
+          axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0))))
+
+tiff("figures/boxplots/pseudocount_raw.tiff", 
+     res = 300, 
+     width = 5.5, 
+     height = 5.5, 
+     units = 'in', 
+     bg = NA)
+
+print(g1)
+
+dev.off()
+
+# 2) PCA plot
+
+plotPCA3 <- function (datos, labels, factor, title, scale, size = 1.5, glineas = 0.25) {
+  
+  data <- prcomp(t(datos), scale = scale)
+  
+  # plot adjustments
+  
+  dataDf <- data.frame(data$x)
+  Group <- factor
+  loads <- round(data$sdev^2/sum(data$sdev^2) * 100, 1)
+  
+  # main plot
+  
+  p1 <- ggplot(data = dataDf, aes(x = PC1, y = PC2)) +
+    theme_classic() +
+    geom_hline(yintercept = 0, color = "gray70") +
+    geom_vline(xintercept = 0, color = "gray70") +
+    geom_point(aes(color = Group), size = 2) +
+    coord_cartesian(xlim = c(min(data$x[ , 1]) - 5, max(data$x[ , 1]) + 5)) +
+    scale_fill_discrete(name = "Group") +
+    theme(axis.title.y = element_text(size = 10,
+                                      margin = margin(t = 0, r = 10, b = 0, l = 0)),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, r = 0, b = 0, l = 0)),
+          axis.text = element_text(size = 7), 
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 10),
+          legend.key.size = unit(0.4, "cm"),
+          legend.key.width = unit(0.5,"cm")) 
+  
+  # avoiding labels superposition
+  
+  p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels), segment.size = 0.25, size = size) + 
+    labs(x = c(paste("PC1", loads[1], "%")), y = c(paste("PC2", loads[2], "%"))) +  
+    ggtitle(paste("PCA for: ", title, sep = " ")) + 
+    scale_color_viridis(discrete = T)
+}
+
+dir.create("figures/PCA_plots")
+
+tiff("figures/PCA_plots/PCA_raw.tiff", 
+       res = 300, 
+       width = 5.5, 
+       height = 5.5, 
+       units = 'in', 
+       bg = NA)
+  
+print(plotPCA3(datos = assay(vsd), 
+                 labels = colnames(counts_raw_sub), 
+                 factor = targets_raw_sub$Group, 
+                 title = "transformed counts", 
+                 scale = F, 
+                 size = 2.5))
+
+dev.off()
+
+# 3) Dendrograma
+
+sample_dist <- dist(t(assay(vsd)))
+res <- hcut(sample_dist, k = 2, stand = T, method = "euclidean")
+res$labels <- as.character(colnames(dds_mat_filtered))
+
+dir.create("figures/dendrograms")
+
+tiff("figures/dendrograms/dendrogram.tiff", 
+     res = 300, 
+     width = 10, 
+     height = 5.5, 
+     units = 'in', 
+     bg = NA)
+
+print(fviz_dend(res, 
+                rect = T, 
+                cex = 0.5, 
+                lwd = 1, 
+                k_colors = c("#440154FF", "#FDE725FF"), 
+                label_cols = "black"))
+
+dev.off()
+
+# -------------------------------------------------------------------------------------------------------------------------
+
+# Selección de genes diferencialmente expresados (DEG) 
+
+# 1) Construyendo DESeq2DataSet
+
+dds_mat <- DESeqDataSetFromMatrix(countData = count_data, 
+                                  colData = col_data, 
+                                  design = ~ Group)
+
+# 2) Filtrando genes que cierta expresión
+
+dds_mat_filtered <- dds_mat[rowSums(counts(dds_mat)) >= 1, ]
+
+# 3) Creación de objeto DESeq
+
+dds <- DESeq(dds_mat_filtered, parallel = T)
+
+# 4) Contrastes
+
+# 4.1) NIT vs SFI
+
+# 4.1.1) Generando resultados contraste
+
+res_1 <- results(dds, contrast = c("Group","NIT","SFI"))
+
+# 4.1.2) Modificando los ENSEMBL gene ids
+
+rownames(res_1) <- gsub("\\..*","", rownames(res_1))
+
+# 4.1.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_1 <- summary(res_1, alpha = 0.1)
+
+# 4.1.4) Anotando DEG (genesymbol + entrezid)
+
+res_1$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_1), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_1$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_1),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.1.5) Eliminando genes que no tienen anotación
+
+res_1 <- na.omit(res_1)
+
+# 4.1.6) Guardando el contenido de la toptable
+
+dir.create("results/top_taples")
+
+write.csv(x = res_1, 
+          file = "results/top_taples/top_table_NITvsSFI.csv", 
+          row.names = T)
+
+# 4.1.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_1_filtered <- as.data.frame(res_1)[which(res_1$padj < 0.1 & abs(res_1$log2FoldChange) > 2), ]
+res_1_filtered <- res_1_filtered[order(res_1_filtered$padj), ]
+View(res_1_filtered)
+
+# 4.1.8) Guardando el contenido de la toptable filtrada
+
+dir.create("results/top_tables_filtered")
+
+write.csv(x = res_1_filtered, 
+          file = "results/top_tables_filtered/top_table_NITvsSFI_filtered.csv", 
+          row.names = T)
+
+# 4.1.9) Volcano plot
+
+dir.create("figures/volcano_plots")
+
+tiff(filename = "figures/volcano_plots/volcano_plot_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_1, 
+                      lab = res_1$symbol,
+                      selectLab = res_1$symbol[order(res_1$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 7), 
+                      xlim = c(-7, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "NIT vs SFI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.1.10) heatmap
+
+dir.create("figures/heatmaps")
+
+h_res_1 <- as.matrix(counts_raw_sub[rownames(res_1_filtered), 1:20])
+rownames(h_res_1) <- res_1_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_1)
+
+dev.off()
+
+# 4.2) NIT vs ELI
+
+# 4.2.1) Generando resultados contraste
+
+res_2 <- results(dds, contrast = c("Group", "NIT", "ELI"))
+
+# 4.2.2) Modificando los ENSEMBL gene ids
+
+rownames(res_2) <- gsub("\\..*","", rownames(res_2))
+
+# 4.2.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_1 <- summary(res_2, alpha = 0.1)
+
+# 4.2.4) Anotando DEG
+
+res_2$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_2), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_2$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_2),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.2.5) Eliminando genes que no tienen anotación
+
+res_2 <- na.omit(res_2)
+
+# 4.2.6) Guardando el contenido de la toptable
+
+write.csv(x = res_2, 
+          file = "results/top_taples/top_table_NITvsELI.csv", 
+          row.names = T)
+
+# 4.2.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_2_filtered <- as.data.frame(res_2)[which(res_2$padj < 0.1 & abs(res_2$log2FoldChange) > 2), ]
+res_2_filtered <- res_2_filtered[order(res_2_filtered$padj), ]
+View(res_2_filtered)
+
+# 4.2.8) Guardando contenido de la toptable filtrada
+
+write.csv(x = res_2_filtered, 
+          file = "results/top_tables_filtered/top_table_NITvsELI_filtered.csv", 
+          row.names = T)
+
+# 4.2.9) Volcano plot
+
+tiff(filename = "figures/volcano_plots/volcano_plot_NITvsELI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_2, 
+                      lab = res_2$symbol,
+                      selectLab = res_2$symbol[order(res_2$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 30), 
+                      xlim = c(-10, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "NIT vs ELI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.2.10) heatmap
+
+h_res_2 <- as.matrix(counts_raw_sub[rownames(res_2_filtered), 1:20])
+rownames(h_res_2) <- res_2_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_2)
+
+dev.off()
+
+# 4.3) SFI vs ELI
+
+# 4.3.1) Generando resultados contraste
+
+res_3 <- results(dds, contrast = c("Group", "SFI", "ELI"))
+
+# 4.3.2) Modificando los ENSEMBL gene ids
+
+rownames(res_3) <- gsub("\\..*","", rownames(res_3))
+
+# 4.3.3) Consultando resumen de los resultados (padj < 0.1)
+
+summary_3 <- summary(res_3, alpha = 0.1)
+
+# 4.3.4) Anotando DEG
+
+res_3$symbol <- mapIds(x = org.Hs.eg.db, 
+                       keys = rownames(res_3), 
+                       column = "SYMBOL", 
+                       keytype = "ENSEMBL", 
+                       multiVals = "first")
+
+res_3$entrez <- mapIds(x = org.Hs.eg.db,
+                       keys = rownames(res_3),
+                       column = "ENTREZID",
+                       keytype = "ENSEMBL",
+                       multiVals="first")
+
+# 4.3.5) Eliminando genes que no tienen anotación
+
+res_3 <- na.omit(res_3)
+
+# 4.3.6) Guardando el contenido de la toptable
+
+write.csv(x = res_3, 
+          file = "results/top_taples/top_table_SFIvsELI.csv", 
+          row.names = T)
+
+# 4.3.7) Filtrando DEG (log2FC > 2 & padj < 0.1)
+
+res_3_filtered <- as.data.frame(res_3)[which(res_3$padj < 0.1 & abs(res_3$log2FoldChange) > 2), ]
+res_3_filtered <- res_3_filtered[order(res_3_filtered$padj), ]
+View(res_filtered)
+
+# 4.3.8) Guardando contenido de la toptable filtrada
+
+write.csv(x = res_3_filtered, 
+          file = "results/top_tables_filtered/top_table_SFIvsELI_filtered.csv", 
+          row.names = T)
+
+# 4.3.9) Volcano plot
+
+tiff(filename = "figures/volcano_plots/volcano_plot_SFIvsELI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+print(EnhancedVolcano(toptable = res_3, 
+                      lab = res_3$symbol,
+                      selectLab = res_3$symbol[order(res_3$padj)][1:5],
+                      x = "log2FoldChange", 
+                      y = "padj", 
+                      pCutoff = 0.1, 
+                      FCcutoff = 1,
+                      ylim = c(0, 15), 
+                      xlim = c(-10, 5), 
+                      pointSize = 1.7,
+                      axisLabSize = 13,
+                      labSize = 4,
+                      subtitle = "",
+                      caption = "",
+                      title = "SFI vs ELI", 
+                      titleLabSize = 18, 
+                      legendVisible = F,
+                      legendPosition = "bottom", 
+                      legendLabSize = 10, 
+                      legendIconSize = 3))
+
+dev.off()
+
+# 4.3.10) heatmap
+
+h_res_3 <- as.matrix(counts_raw_sub[rownames(res_3_filtered), 1:20])
+rownames(h_res_3) <- res_3_filtered$symbol
+
+tiff(filename = "figures/heatmaps/heatmap_NITvsSFI.tiff", 
+     width = 5.5, 
+     height = 5.5, 
+     res = 300, 
+     units = "in")
+
+heatmap(h_res_3)
+
+legend("topright",     
+       legend = c("NIT", "SFI"), 
+       col = c("royalblue3","goldenrod"),
+       lty = 1,
+       lwd = 10)
+
+dev.off()
+
+# -------------------------------------------------------------------------------------------------------------------------
+
+# Análisis de significación (gene enrichment analysis)
+
+# 1) NIT vs SFI
+
+dir.create("results/GO_tables")
+dir.create("figures/cnet_plots")
+dir.create("figures/bar_plots")
+
+entrez_res_1 <- res_1_filtered$entrez
+
+res_1_enriched <- enrichGO(gene = entrez_res_1,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, 
+                           qvalueCutoff = 0.05,
+                           readable = TRUE)
+
+GO_table_res_1 <- as.data.frame(res_1_enriched@result)[ , 1:7]
+GO_table_res_1 <- GO_table_res_1[GO_table_res_1$p.adjust < 0.05 & GO_table_res_1$qvalue < 0.05, ]
+View(GO_table_res_1)
+
+write.csv(x = GO_table_res_1, 
+          file = "results/GO_tables/GO_table_NITvsSFI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_NITvsSFI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_1_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_1_filtered$log2FoldChange[res_1_filtered$padj < 0.05]
+names <- res_1_filtered$symbol[res_1_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_NITvsSFI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_1_enriched, 
+         node_label = "all", 
+         showCategory = 5, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()
+
+# 2) NIT vs ELI
+
+entrez_res_2 <- res_2_filtered$entrez
+
+res_2_enriched <- enrichGO(gene = entrez_res_2,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, 
+                           qvalueCutoff = 0.05,
+                           readable = TRUE)
+
+GO_table_res_2 <- as.data.frame(res_2_enriched@result)[ , 1:7]
+GO_table_res_2 <- GO_table_res_2[GO_table_res_2$p.adjust < 0.05 & GO_table_res_2$qvalue < 0.05, ]
+View(GO_table_res_2)
+
+write.csv(x = GO_table_res_2, 
+          file = "results/GO_tables/GO_table_NITvsELI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_NITvsELI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_2_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_2_filtered$log2FoldChange[res_2_filtered$padj < 0.05]
+names <- res_2_filtered$symbol[res_2_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_NITvsELI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_2_enriched, 
+         node_label = "all", 
+         showCategory = 4, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()
+
+# 3) SFI vs ELI
+
+entrez_res_3 <- res_3_filtered$entrez
+
+res_3_enriched <- enrichGO(gene = entrez_res_3,
+                           OrgDb = org.Hs.eg.db,
+                           ont = "BP",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.15,
+                           readable = TRUE)
+
+GO_table_res_3 <- as.data.frame(res_3_enriched@result)[ , 1:7]
+GO_table_res_3 <- GO_table_res_3[GO_table_res_3$p.adjust < 0.05 & GO_table_res_3$qvalue < 0.05, ]
+View(GO_table_res_3)
+
+write.csv(x = GO_table_res_3, 
+          file = "results/GO_tables/GO_table_SFIvsELI.csv", 
+          row.names = T)
+
+tiff(filename = "figures/bar_plots/bar_plot_SFIvsELI.tiff", 
+     width = 15, 
+     height = 8, 
+     res = 300, 
+     units = "in")
+
+barplot(res_3_enriched, showCategory = 10) 
+
+dev.off()
+
+logFC <- res_3_filtered$log2FoldChange[res_3_filtered$padj < 0.05]
+names <- res_3_filtered$symbol[res_3_filtered$padj < 0.05]
+vec <- setNames(logFC, names)
+
+tiff(filename = "figures/cnet_plots/cnet_plot_SFIvsELI.tiff", 
+     width = 7.5, 
+     height = 7, 
+     res = 300, 
+     units = "in")
+
+cnetplot(x = res_3_enriched, 
+         node_label = "all", 
+         showCategory = 4, 
+         foldChange = vec, 
+         layout = "kk", 
+         circular = F)
+
+dev.off()

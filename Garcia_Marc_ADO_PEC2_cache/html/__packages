@@ -1,0 +1,17 @@
+base
+knitr
+kableExtra
+readxl
+magrittr
+BiocGenerics
+S4Vectors
+IRanges
+GenomeInfoDb
+GenomicRanges
+Biobase
+matrixStats
+BiocParallel
+DelayedArray
+SummarizedExperiment
+DESeq2
+cowplot
